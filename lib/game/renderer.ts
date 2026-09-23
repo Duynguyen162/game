@@ -3,19 +3,20 @@
 //   mid  (tile < 30px): cached terrain chunks @16px/tile with trees baked in, units as dots
 //   near (tile ≥ 30px): terrain drawn live (animated foam / water rocks / bushes), trees,
 //                       buildings and unit sprites depth-sorted, forest canopy fades to 40%
-import { ANIMS, AN, P, PAWN, buildingPath, unitPath, type Assets } from "./assets";
+import { type Assets } from "./assets";
+import { ANIMS, AN, P, PAWN, buildingPath, unitPath } from "@game/shared";
 import {
   COLOR_HEX, FOREST_REVEAL_ALPHA, FORD, LAND, MAX_LEVEL, MH, MW, N, RAMP_L_TOP, RAMP_R_TOP, T, WATER,
   WORLD_H, WORLD_W, type TeamColor,
-} from "./constants";
+} from "@game/shared";
 import {
   BH, BK, BW, D_BUSH, D_DUCK, D_GOLD, D_GOLD_RES, D_MEAT_RES, D_ROCK, D_STUMP, D_TOOL, D_WOOD_RES, D_WROCK,
   type Building, type GameMap,
-} from "./map";
-import { hash2 } from "./rng";
-import { FX_DUST, FX_EXPLOSION, FX_HEAL, FX_SPLASH, type World } from "./world";
+} from "@game/shared";
+import { hash2 } from "@game/shared";
+import { FX_DUST, FX_EXPLOSION, FX_HEAL, FX_SPLASH, VIS_RADIUS, type World } from "@game/shared";
 
-export interface Camera { x: number; y: number; zoom: number }
+export interface Camera { x: number; y: number; zoom: number; targetX?: number; targetY?: number; }
 
 export interface ViewOptions {
   viewer: number; // -1 spectator, 0 west, 1 east
@@ -35,8 +36,22 @@ export class Renderer {
   private far = new Map<string, Chunk>();
   minimap: HTMLCanvasElement;
   dpr = 1;
+  // ---- Sương mù chiến tranh: canvas 1px/ô, lerp alpha để mắp sương không giật
+  private fogCanvas: HTMLCanvasElement;
+  private fogCtx: CanvasRenderingContext2D;
+  private fogImg: ImageData;           // buffer 4-byte/ô
+  private fogAlpha = new Float32Array(N); // alpha hiện tại (lerp’d), 0.0–1.0
+
   constructor(private m: GameMap, private a: Assets) {
     this.minimap = this.buildMinimap();
+    // Khởi tạo fog canvas (512x512 pixel, mỗi pixel ứng với 1 ô bản đồ)
+    this.fogCanvas = document.createElement("canvas");
+    this.fogCanvas.width = MW;
+    this.fogCanvas.height = MH;
+    this.fogCtx = this.fogCanvas.getContext("2d")!;
+    this.fogImg = this.fogCtx.createImageData(MW, MH);
+    // Khởi tạo mờ 55% (đã biết địa hình, chưa có tầm nhìn) — không đen đặc
+    this.fogAlpha.fill(0.55);
   }
 
   dispose() {
@@ -308,7 +323,7 @@ export class Renderer {
 
   // ------------------------------------------------------------ frame
 
-  render(ctx: CanvasRenderingContext2D, w: World, cam: Camera, vw: number, vh: number, opt: ViewOptions, time: number, selBox: [number, number, number, number] | null, hoverTile: number) {
+  render(ctx: CanvasRenderingContext2D, w: World, cam: Camera, vw: number, vh: number, opt: ViewOptions, time: number, selBox: [number, number, number, number] | null, hoverTile: number, dt = 0.016) {
     const ts = T * cam.zoom;
     const d = this.dpr;
     ctx.setTransform(d, 0, 0, d, 0, 0);
@@ -352,6 +367,8 @@ export class Renderer {
       this.drawArrows(ctx, w, opt, wx0, wy0, wx1, wy1);
       this.drawFx(ctx, w, wx0, wy0, wx1, wy1);
     }
+    // ---- Sương mù: vẽ sau units, trước mây và UI
+    this.drawFog(ctx, w, opt.viewer, wx0, wy0, wx1, wy1, dt);
     if (opt.showNav) this.drawNav(ctx, tx0, ty0, tx1, ty1);
     if (hoverTile >= 0 && ts >= 14) {
       ctx.strokeStyle = "rgba(255,255,255,0.8)";
@@ -377,9 +394,53 @@ export class Renderer {
   }
 
   private unitVisible(w: World, i: number, opt: ViewOptions, presence: Int32Array | null) {
+    // Lính của phe mình luôn thấy
     if (opt.viewer < 0 || w.side[i] === opt.viewer) return true;
+    // Kiểm tra sương mù: ô có visCount > 0 mới thấy lính địch
+    if (opt.viewer >= 0) {
+      const vc = w.visCount[opt.viewer as 0 | 1];
+      if (vc[w.tile[i]] === 0) return false;
+    }
+    // Kiểm tra rừng cây (cơ chế cũ)
     const z = this.m.forest[w.tile[i]];
     return z === 0 || (presence !== null && presence[z] > 0);
+  }
+
+  // ---- Sương mù chiến tranh: lerp alpha, vẽ lớp phủ lên bản đồ ----
+  // Gọi sau khi đã vẽ xong terrain + lính
+  private drawFog(ctx: CanvasRenderingContext2D, w: World, viewer: number, wx0: number, wy0: number, wx1: number, wy1: number, dt: number) {
+    if (viewer < 0) return; // Spectator: không có sương mù
+    const s = viewer as 0 | 1;
+    const vc = w.visCount[s];
+    const ex = w.explored[s];
+    const fa = this.fogAlpha;
+    const img = this.fogImg;
+    const d = img.data;
+
+    // Tile range cần cập nhật (chỉ vùng nhìn thấy + buffer 2 ô)
+    const tx0 = Math.max(0, Math.floor(wx0 / T) - 2);
+    const ty0 = Math.max(0, Math.floor(wy0 / T) - 2);
+    const tx1 = Math.min(MW, Math.ceil(wx1 / T) + 2);
+    const ty1 = Math.min(MH, Math.ceil(wy1 / T) + 2);
+
+    for (let ty = ty0; ty < ty1; ty++) for (let tx = tx0; tx < tx1; tx++) {
+      const t = ty * MW + tx;
+      // Target alpha: đang thấy=0 (trong suốt), đã khám phá=0.55, chưa khám phá=1.0
+      const target = vc[t] > 0 ? 0 : ex[t] ? 0.55 : 1.0;
+      // Lerp mượt alpha để viền sương mù không giật khi cập nhật 3Hz
+      fa[t] += (target - fa[t]) * Math.min(1, dt * 5);
+      const a = (fa[t] * 255) | 0;
+      const pi = t * 4;
+      d[pi] = 0; d[pi+1] = 0; d[pi+2] = 0; d[pi+3] = a;
+    }
+
+    this.fogCtx.putImageData(this.fogImg, 0, 0);
+    // Phóng to fog canvas lên bản đồ với imageSmoothingEnabled=true để viền mờ mềm
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "medium";
+    ctx.drawImage(this.fogCanvas, 0, 0, WORLD_W, WORLD_H);
+    ctx.restore();
   }
 
   private drawUnitDots(ctx: CanvasRenderingContext2D, w: World, opt: ViewOptions, presence: Int32Array | null, wx0: number, wy0: number, wx1: number, wy1: number, ts: number) {

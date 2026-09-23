@@ -1,16 +1,23 @@
 "use client";
-
+import { io } from "socket.io-client";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Assets, colorPaths, staticPaths, UNIT_VI } from "@/lib/game/assets";
-import { COLORS, COLOR_HEX, COLOR_VI, FORD, MH, MW, SPEED_FORD, T, WATER, WORLD_H, WORLD_W, type TeamColor } from "@/lib/game/constants";
-import { generateMap, passable } from "@/lib/game/map";
+import { Assets } from "@/lib/game/assets";
+import { UNIT_VI, colorPaths, staticPaths } from "@game/shared";
+import { COLORS, COLOR_HEX, COLOR_VI, FORD, MH, MW, SPEED_FORD, T, WATER, WORLD_H, WORLD_W, type TeamColor } from "@game/shared";
+import { generateMap, passable } from "@game/shared";
 import { Renderer, type Camera, type ViewOptions } from "@/lib/game/renderer";
-import { World } from "@/lib/game/world";
+import { World } from "@game/shared";
 
 const UI = "/assets/UI%20Elements/UI%20Elements";
 const TICK = 0.1;
-const AVATAR_TYPE = [2, 3, 4, 6, 7];
+const AVATAR_TYPE = [2, 3, 6, 4, 7];
 
+// Mở kết nối
+const socket = io(process.env.NEXT_PUBLIC_GAME_SERVER_URL!);
+// Lắng nghe sự kiện tick
+socket.on("tick", (serverTick) => {
+   // Xử lý chạy step game ở đây
+});
 interface Stats {
   alive: [number, number];
   types: [number[], number[]];
@@ -48,11 +55,11 @@ function describeTile(w: World, i: number): Hover {
 }
 
 function clampCam(cam: Camera, vw: number, vh: number) {
-  const minZoom = Math.min(vw / WORLD_W, vh / WORLD_H) * 0.95;
+  const minZoom = Math.max(vw / WORLD_W, vh / WORLD_H);
   cam.zoom = Math.max(minZoom, Math.min(1.6, cam.zoom));
   const hw = vw / 2 / cam.zoom, hh = vh / 2 / cam.zoom;
-  cam.x = hw * 2 >= WORLD_W ? WORLD_W / 2 : Math.max(hw, Math.min(WORLD_W - hw, cam.x));
-  cam.y = hh * 2 >= WORLD_H ? WORLD_H / 2 : Math.max(hh, Math.min(WORLD_H - hh, cam.y));
+  cam.x = Math.max(hw, Math.min(WORLD_W - hw, cam.x));
+  cam.y = Math.max(hh, Math.min(WORLD_H - hh, cam.y));
 }
 
 function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions, w: World, r: Renderer, vw: number, vh: number) {
@@ -66,6 +73,12 @@ function drawMinimap(c: HTMLCanvasElement | null, cam: Camera, opt: ViewOptions,
     g.fillStyle = COLOR_HEX[opt.colors[s]];
     for (let i = s; i < w.n; i += 6) {
       if (!w.alive[i] || w.side[i] !== s) continue;
+      // Kiểm tra sương mù: ẩn quân địch ở ô chưa có tầm nhìn
+      if (opt.viewer >= 0 && s !== opt.viewer) {
+        const vc = w.visCount[opt.viewer as 0 | 1];
+        if (vc[w.tile[i]] === 0) continue; // ẩn quân địch trong sương mù
+      }
+      // Kiểm tra rừng cây (cơ chế cũ)
       if (opt.viewer >= 0 && s !== opt.viewer && w.m.forest[w.tile[i]] && !w.presence[opt.viewer][w.m.forest[w.tile[i]]]) continue;
       g.fillRect(w.x[i] * k, w.y[i] * k, 1.5, 1.5);
     }
@@ -104,6 +117,30 @@ export default function BattleMap() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
   const [zoomPct, setZoomPct] = useState(70);
+  const [showTopUI, setShowTopUI] = useState(true);
+  const [showLeftUI, setShowLeftUI] = useState(true);
+  const [showRightUI, setShowRightUI] = useState(true);
+  const [focusType, setFocusType] = useState<number | null>(null);
+  const [focusIdx, setFocusIdx] = useState<number>(0);
+
+  const handleFocus = useCallback((type: number) => {
+    const w = worldRef.current;
+    if (!w) return;
+    const side = viewer === 1 ? 1 : 0;
+    const clusters = w.getClusters(type, side);
+    if (clusters.length === 0) return;
+    
+    let idx = 0;
+    if (focusType === type) {
+      idx = (focusIdx + 1) % clusters.length;
+    }
+    setFocusType(type);
+    setFocusIdx(idx);
+    
+    const c = clusters[idx];
+    camRef.current.targetX = c.x;
+    camRef.current.targetY = c.y;
+  }, [focusType, focusIdx, viewer]);
 
   useEffect(() => { optRef.current = { viewer, colors, showClouds, showNav }; }, [viewer, colors, showClouds, showNav]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
@@ -176,6 +213,17 @@ export default function BattleMap() {
       if (k.has("d") || k.has("arrowright")) cam.x += pan;
       if (k.has("w") || k.has("arrowup")) cam.y -= pan;
       if (k.has("s") || k.has("arrowdown")) cam.y += pan;
+
+      // smooth pan camera to target
+      if (cam.targetX !== undefined && cam.targetY !== undefined) {
+        cam.x += (cam.targetX - cam.x) * (dt * 15);
+        cam.y += (cam.targetY - cam.y) * (dt * 15);
+        if (Math.hypot(cam.targetX - cam.x, cam.targetY - cam.y) < 5) {
+          cam.targetX = undefined;
+          cam.targetY = undefined;
+        }
+      }
+
       clampCam(cam, vw, vh);
 
       acc += dt * speedRef.current;
@@ -184,7 +232,7 @@ export default function BattleMap() {
       if (steps === 3) acc = 0;
 
       r.dpr = dpr;
-      r.render(ctx, w, cam, vw, vh, optRef.current, w.time + acc, boxRef.current, hoverRef.current);
+      r.render(ctx, w, cam, vw, vh, optRef.current, w.time + acc, boxRef.current, hoverRef.current, dt);
 
       drawMinimap(miniRef.current, cam, optRef.current, w, r, vw, vh);
       statT += dt;
@@ -280,7 +328,10 @@ export default function BattleMap() {
     } else if (d.mode === "right") {
       const [wx, wy] = toWorld(sx, sy);
       const sel = w.selected();
-      if (sel.length) w.orderMove(sel, Math.floor(wx / T), Math.floor(wy / T));
+      if (sel.length) {
+        w.orderMove(sel, Math.floor(wx / T), Math.floor(wy / T));
+        w.addFx(0, wx, wy, 0); // 0 = FX_DUST
+      }
     }
   };
   useEffect(() => {
@@ -322,43 +373,48 @@ export default function BattleMap() {
       />
 
       {/* ---- top: army scoreboard */}
-      <div className="pointer-events-none absolute left-1/2 top-2 flex -translate-x-1/2 flex-col items-center">
-        <div className={`ts-ribbon ts-ribbon-${colors[0].toLowerCase()} min-w-[420px] px-2 text-lg ts-title`}>ĐẠI CHIẾN 40.000 QUÂN</div>
-        <div className="ts-wood -mt-2 flex items-center gap-3 text-[var(--cream)]">
-          <Army side={0} color={colors[0]} stats={stats} />
-          <span className="ts-title text-2xl text-[#ffd76a] [text-shadow:0_2px_0_#000]">VS</span>
-          <Army side={1} color={colors[1]} stats={stats} />
+      {showTopUI && (
+        <div className="pointer-events-none absolute left-1/2 top-2 flex -translate-x-1/2 flex-col items-center">
+          <div className="pointer-events-auto flex items-center justify-between w-full">
+            <div className={`ts-ribbon ts-ribbon-${colors[0].toLowerCase()} min-w-[420px] px-2 text-lg ts-title mx-auto`}>ĐẠI CHIẾN 40.000 QUÂN</div>
+            <button onClick={() => setShowTopUI(false)} className="ts-btn text-xs px-2 py-0 h-6 -ml-10">Ẩn</button>
+          </div>
+          <div className="ts-wood -mt-2 flex items-center gap-3 text-[var(--cream)]">
+            <Army side={0} color={colors[0]} stats={stats} />
+            <span className="ts-title text-2xl text-[#ffd76a] [text-shadow:0_2px_0_#000]">VS</span>
+            <Army side={1} color={colors[1]} stats={stats} />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* ---- left: command panel */}
-      <div className="ts-wood absolute left-2 top-2 w-[292px] text-[var(--cream)]">
-        <div className="ts-title mb-1 text-base">Bàn chỉ huy</div>
-        <Label>Góc nhìn (tầm nhìn rừng)</Label>
-        <div className="mb-2 grid grid-cols-3 gap-1">
-          {[[0, "Tây"], [-1, "Toàn cảnh"], [1, "Đông"]].map(([v, l]) => (
-            <button key={v} className="ts-btn text-xs" data-on={viewer === v} onClick={() => setViewer(v as number)}>{l}</button>
-          ))}
-        </div>
-        {[0, 1].map((s) => (
-          <div key={s} className="mb-1.5">
-            <Label>Màu quân {s === 0 ? "Tây" : "Đông"}</Label>
+      {showLeftUI && (
+        <div className="ts-wood absolute left-2 top-2 w-[292px] text-[var(--cream)]">
+          <div className="ts-title mb-1 text-base flex justify-between items-center">
+            <span>Bàn chỉ huy</span>
+            <button onClick={() => setShowLeftUI(false)} className="ts-btn text-xs px-2 py-0">Ẩn</button>
+          </div>
+          <Label>Góc nhìn (tầm nhìn rừng)</Label>
+          <div className="mb-2 grid grid-cols-3 gap-1">
+            {[[0, "Tây"], [-1, "Toàn cảnh"], [1, "Đông"]].map(([v, l]) => (
+              <button key={v} className="ts-btn text-xs" data-on={viewer === v} onClick={() => setViewer(v as number)}>{l}</button>
+            ))}
+          </div>
+          <div className="mb-2">
+            <Label>Đơn vị quân đội</Label>
             <div className="flex gap-1">
-              {COLORS.map((c) => (
+              {[0, 1, 2, 3, 4].map((t) => (
                 <button
-                  key={c}
-                  aria-label={COLOR_VI[c]}
-                  disabled={colors[1 - s] === c}
-                  onClick={() => pickColor(s as 0 | 1, c)}
-                  style={{ borderWidth: "0 9px", borderImageWidth: "0 9px" }}
-                  className={`ts-ribbon ts-ribbon-${c.toLowerCase()} !h-8 min-w-0 flex-1 !pb-1 text-[10px] disabled:opacity-25 ${colors[s] === c ? "outline outline-2 outline-[#fff6c8]" : ""}`}
+                  key={t}
+                  onClick={() => handleFocus(t)}
+                  className={`ts-btn text-xs flex-1 !min-h-[40px] !px-1 ${focusType === t ? "outline outline-2 outline-[#fff6c8]" : ""}`}
+                  title={UNIT_VI[t]}
                 >
-                  {COLOR_VI[c]}
+                  <img src={`${UI}/Human%20Avatars/Avatars_0${AVATAR_TYPE[t]}.png`} alt="" className="h-6 w-6 mx-auto" />
                 </button>
               ))}
             </div>
           </div>
-        ))}
         <div className="mt-2 grid grid-cols-2 gap-1">
           <button className="ts-btn red text-sm" disabled={!!loading || !!stats?.started} onClick={() => worldRef.current?.orderCharge([0, 1])}>
             <img src={`${UI}/Icons/Icon_05.png`} alt="" className="h-6 w-6" /> Xung trận
@@ -381,23 +437,28 @@ export default function BattleMap() {
             ))}
           </div>
         </div>
-        <div className="mt-2 text-[11px] leading-snug opacity-80">
-          Kéo chuột trái: chọn quân · Chuột phải: ra lệnh · Kéo chuột phải/giữa hoặc WASD: di chuyển · Lăn chuột: phóng to · 1–5: chọn binh chủng · Q: cả đạo quân · H: giữ vị trí
+          <div className="mt-2 text-[11px] leading-snug opacity-80">
+            Kéo chuột trái: chọn quân · Chuột phải: ra lệnh · Kéo chuột phải/giữa hoặc WASD: di chuyển · Lăn chuột: phóng to · 1–5: chọn binh chủng · Q: cả đạo quân · H: giữ vị trí
+          </div>
         </div>
-      </div>
+      )}
 
       {/* ---- right: legend + tile info */}
-      <div className="ts-paper absolute right-2 top-2 w-[250px] text-[var(--ink)]">
-        <div className="ts-title mb-1 text-base">Địa hình</div>
-        <Legend color="#a5be50" name="Đồng cỏ" note="1.0x" />
-        <Legend color="#2c5c34" name="Rừng phục kích" note="1.0x · tàng hình" />
-        <Legend color="#8ccdbe" name="Bãi cạn" note={`${SPEED_FORD}x`} />
-        <Legend color="#a86e3c" name="Cầu (3 cầu)" note="1.0x · nút thắt" />
-        <Legend color="#47aba9" name="Nước sâu" note="chặn" />
-        <Legend color="#556e73" name="Vách đá" note="chặn" />
-        <Legend color="#c8be6e" name="Dốc lên cao nguyên" note="lối duy nhất" />
-        <Legend color="#96b946" name="Cao nguyên 1–3 tầng" note="+2 tầm cung" />
-        <div className="mt-2 min-h-[64px] border-t border-[#3b2416]/30 pt-1.5">
+      {showRightUI && (
+        <div className="ts-paper absolute right-2 top-2 w-[250px] text-[var(--ink)]">
+          <div className="ts-title mb-1 text-base flex justify-between">
+            <span>Địa hình</span>
+            <button onClick={() => setShowRightUI(false)} className="ts-btn text-xs px-2 py-0">Ẩn</button>
+          </div>
+          <Legend color="#a5be50" name="Đồng cỏ" note="1.0x" />
+          <Legend color="#2c5c34" name="Rừng phục kích" note="1.0x · tàng hình" />
+          <Legend color="#8ccdbe" name="Bãi cạn" note={`${SPEED_FORD}x`} />
+          <Legend color="#a86e3c" name="Cầu (3 cầu)" note="1.0x · nút thắt" />
+          <Legend color="#47aba9" name="Nước sâu" note="chặn" />
+          <Legend color="#556e73" name="Vách đá" note="chặn" />
+          <Legend color="#c8be6e" name="Dốc lên cao nguyên" note="lối duy nhất" />
+          <Legend color="#96b946" name="Cao nguyên 1–3 tầng" note="+2 tầm cung" />
+          <div className="mt-2 min-h-[64px] border-t border-[#3b2416]/30 pt-1.5">
           {hover ? (
             <>
               <div className="font-bold">Ô ({hover.x}, {hover.y})</div>
@@ -409,14 +470,31 @@ export default function BattleMap() {
           )}
         </div>
         <div className="mt-1 text-[11px] opacity-70">Thu phóng: {zoomPct}%</div>
-        <div className="mt-1 flex gap-1">
-          <button className="ts-btn flex-1 !min-h-[40px] text-xs" onClick={() => zoomTo(0.02)}>Toàn bản đồ</button>
-          <button className="ts-btn flex-1 !min-h-[40px] text-xs" onClick={() => zoomTo(0.8)}>Cận cảnh</button>
+          <div className="mt-1 flex gap-1">
+            <button className="ts-btn flex-1 !min-h-[40px] text-xs" onClick={() => zoomTo(0.02)}>Toàn bản đồ</button>
+            <button className="ts-btn flex-1 !min-h-[40px] text-xs" onClick={() => zoomTo(0.8)}>Cận cảnh</button>
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* ---- bottom-left: minimap */}
-      <div className="ts-banner absolute bottom-2 left-2">
+      {!showTopUI && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2">
+          <button className="ts-btn text-xs px-2 py-1 bg-white opacity-50 hover:opacity-100" onClick={() => setShowTopUI(true)}>Điểm số</button>
+        </div>
+      )}
+      {!showLeftUI && (
+        <div className="absolute left-2 top-2">
+          <button className="ts-btn text-xs px-2 py-1 bg-white opacity-50 hover:opacity-100" onClick={() => setShowLeftUI(true)}>Chỉ huy</button>
+        </div>
+      )}
+      {!showRightUI && (
+        <div className="absolute right-2 top-2">
+          <button className="ts-btn text-xs px-2 py-1 bg-white opacity-50 hover:opacity-100" onClick={() => setShowRightUI(true)}>Địa hình</button>
+        </div>
+      )}
+
+      {/* ---- bottom-right: minimap */}
+      <div className="ts-banner absolute bottom-2 right-2">
         <canvas ref={miniRef} width={220} height={220} className="block h-[220px] w-[220px] [image-rendering:pixelated]" onPointerDown={miniNav} onPointerMove={miniNav} />
       </div>
 

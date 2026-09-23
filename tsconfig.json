@@ -19,7 +19,9 @@
       }
     ],
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["./*"],
+      "@game/shared": ["../shared/src/index.ts"],
+      "@game/shared/*": ["../shared/src/*"]
     }
   },
   "include": [
@@ -28,7 +30,8 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts"
+    "**/*.mts",
+    "../shared/src/**/*.ts"
   ],
   "exclude": ["node_modules"]
 }
